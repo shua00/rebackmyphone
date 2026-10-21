@@ -11,6 +11,7 @@
 
     <application
         android:label="备用机守护"
+        android:usesCleartextTraffic="true"  <!-- 关键：允许 HTTP 明文请求 -->
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
         <service
