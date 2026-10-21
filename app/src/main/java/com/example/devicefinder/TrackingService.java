@@ -23,6 +23,8 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
@@ -38,10 +40,17 @@ public class TrackingService extends Service implements LocationListener {
     private Location lastLocation = null;
 
     private static long lastReportTime = 0;
+    
+    // 失联自愈计数器与状态锁
+    private static int consecutiveFailures = 0;
+    private static boolean isListeningForRescue = false;
 
-    // 默认初始上报地址（后续可由服务端下发新地址并动态热更新覆盖）
+    // 默认初始上报地址（后续可由服务端下发新地址动态热更新覆盖）
     private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
+    
+    // 鉴权密匙与局域网救援安全密码（必须与 rescue.py 中的 RESCUE_SECRET 一致）
     private static final String AUTH_TOKEN = "your_private_secret_key";
+    private static final String RESCUE_SECRET = "your_private_secret_key";
 
     @Override
     public void onCreate() {
@@ -79,7 +88,7 @@ public class TrackingService extends Service implements LocationListener {
         startForeground(1001, notification);
     }
 
-    // 方案一：动态生成并持久化唯一设备 ID
+    // 方案一：动态生成并持久化唯一设备 ID (手机型号 + 4位随机数)
     private String getUniqueDeviceId() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String deviceId = sp.getString("saved_device_id", null);
@@ -92,7 +101,7 @@ public class TrackingService extends Service implements LocationListener {
         return deviceId;
     }
 
-    // 动态获取当前生效的上报服务器地址（支持热更新持久化）
+    // 动态获取当前生效的上报服务器地址
     private String getCurrentServerUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getString("saved_server_url", defaultServerUrl);
@@ -106,6 +115,7 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
+    // 注册网络变动回调（Wi-Fi 跨网即时插队上报）
     private void registerNetworkCallback() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -178,6 +188,7 @@ public class TrackingService extends Service implements LocationListener {
         new Thread(new Runnable() {
             @Override
             public void run() {
+                boolean success = false;
                 try {
                     int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
                     String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
@@ -211,42 +222,90 @@ public class TrackingService extends Service implements LocationListener {
                     locObj.put("provider", loc != null ? loc.getProvider() : "none");
                     json.put("location", locObj);
 
-                    // ==========================================
-                    // 支撑【多路服务器并发备份上报】
-                    // 如果你想同时发给两个服务器，可以把网址放进数组遍历
-                    // ==========================================
-                    String[] targetUrls = { activeUrl }; 
-                    // 示例：String[] targetUrls = { activeUrl, "http://your-backup-server.com/api/report" };
+                    URL url = new URL(activeUrl);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    conn.setConnectTimeout(6000);
+                    conn.setReadTimeout(6000);
+                    conn.setDoOutput(true);
 
-                    for (String targetUrl : targetUrls) {
-                        try {
-                            URL url = new URL(targetUrl);
-                            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                            conn.setRequestMethod("POST");
-                            conn.setRequestProperty("Content-Type", "application/json");
-                            conn.setConnectTimeout(6000);
-                            conn.setReadTimeout(6000);
-                            conn.setDoOutput(true);
+                    OutputStream os = conn.getOutputStream();
+                    os.write(json.toString().getBytes("UTF-8"));
+                    os.flush();
+                    os.close();
 
-                            OutputStream os = conn.getOutputStream();
-                            os.write(json.toString().getBytes("UTF-8"));
-                            os.flush();
-                            os.close();
-
-                            if (conn.getResponseCode() == 200) {
-                                BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                                StringBuilder sb = new StringBuilder();
-                                String line;
-                                while ((line = br.readLine()) != null) sb.append(line);
-                                br.close();
-                                
-                                // 解析响应，顺便接收可能动态下发的新服务器地址
-                                parseResponse(new JSONObject(sb.toString()));
-                            }
-                            conn.disconnect();
-                        } catch (Exception ignored) {}
+                    if (conn.getResponseCode() == 200) {
+                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line);
+                        br.close();
+                        
+                        parseResponse(new JSONObject(sb.toString()));
+                        success = true;
                     }
-                } catch (Exception ignored) {}
+                    conn.disconnect();
+                } catch (Exception e) {
+                    success = false;
+                }
+
+                // 智能失联自愈触发：连续失败达到 3 次时，自动开启 60 秒限时 UDP 监听等待救援
+                if (success) {
+                    consecutiveFailures = 0;
+                } else {
+                    consecutiveFailures++;
+                    if (consecutiveFailures >= 3 && !isListeningForRescue) {
+                        startRescueListener();
+                    }
+                }
+            }
+        }).start();
+    }
+
+    // 60秒限时、带密码校验的局域网 UDP 自愈监听器（零额外日常耗电）
+    private void startRescueListener() {
+        isListeningForRescue = true;
+        
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                DatagramSocket rescueSocket = null;
+                try {
+                    rescueSocket = new DatagramSocket(8888);
+                    rescueSocket.setBroadcast(true);
+                    rescueSocket.setSoTimeout(60000); // 60秒自动超时关闭
+                    
+                    byte[] buffer = new byte[512];
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    
+                    while (true) {
+                        rescueSocket.receive(packet); 
+                        String message = new String(packet.getData(), 0, packet.getLength());
+                        
+                        // 暗号格式预期：FIND_ME_SERVER:密码:新服务器网址
+                        if (message.startsWith("FIND_ME_SERVER:")) {
+                            String[] parts = message.split(":", 3);
+                            if (parts.length == 3) {
+                                String receivedPassword = parts[1];
+                                String newServerUrl = parts[2].trim();
+                                
+                                if (RESCUE_SECRET.equals(receivedPassword)) {
+                                    saveNewServerUrl(newServerUrl);
+                                    consecutiveFailures = 0;
+                                    sendReport(); // 立即向新地址心跳证明复活
+                                    break; 
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    if (rescueSocket != null && !rescueSocket.isClosed()) {
+                        rescueSocket.close();
+                    }
+                    isListeningForRescue = false;
+                }
             }
         }).start();
     }
@@ -256,7 +315,6 @@ public class TrackingService extends Service implements LocationListener {
         JSONObject cfg = res.optJSONObject("config");
         if (cfg == null) return;
 
-        // 1. 动态调整上报频率和精度
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
 
@@ -271,7 +329,7 @@ public class TrackingService extends Service implements LocationListener {
             });
         }
 
-        // 2. 动态热更新上报服务器地址（远程无缝迁移域名/公网IP）
+        // 动态热更新上报服务器地址
         String nextServerUrl = cfg.optString("next_server_url", "");
         if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
             saveNewServerUrl(nextServerUrl);
