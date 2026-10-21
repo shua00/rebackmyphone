@@ -1,0 +1,692 @@
+================================================================================
+🛡️ 极轻量级 Android 备用机防丢系统 — 全套源码与部署指南 (TXT 纯文本版)
+================================================================================
+
+================================================================================
+1. 客户端源码
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 DeviceInfoUtils.java
+路径：app/src/main/java/com/example/devicefinder/DeviceInfoUtils.java
+--------------------------------------------------------------------------------
+package com.example.devicefinder;
+
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+import android.os.BatteryManager;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.util.Enumeration;
+
+public class DeviceInfoUtils {
+
+    public static String cachedSsid = "UNKNOWN";
+    public static String cachedBssid = "UNKNOWN";
+
+    public static int[] getBatteryInfo(Context context) {
+        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batteryStatus = context.registerReceiver(null, ifilter);
+        int level = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) : -1;
+        int scale = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1) : -1;
+        int batteryPct = (int) ((level / (float) scale) * 100);
+
+        int status = batteryStatus != null ? batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1) : -1;
+        int isCharging = (status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                          status == BatteryManager.BATTERY_STATUS_FULL) ? 1 : 0;
+
+        return new int[]{batteryPct, isCharging};
+    }
+
+    public static String[] getWifiInfo(Context context) {
+        WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager == null) return new String[]{cachedSsid, cachedBssid};
+        
+        try {
+            WifiInfo info = wifiManager.getConnectionInfo();
+            String ssid = info != null ? info.getSSID() : "UNKNOWN";
+            
+            if (ssid != null && !ssid.equals("<unknown ssid>") && !ssid.equals("UNKNOWN")) {
+                if (ssid.startsWith("\"") && ssid.endsWith("\"")) {
+                    ssid = ssid.substring(1, ssid.length() - 1);
+                }
+                cachedSsid = ssid;
+                cachedBssid = info.getBSSID() != null ? info.getBSSID() : "UNKNOWN";
+            }
+        } catch (Exception ignored) {}
+
+        return new String[]{cachedSsid, cachedBssid};
+    }
+
+    public static String getLocalIpAddress() {
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+                NetworkInterface intf = en.nextElement();
+                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
+                        return inetAddress.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return "0.0.0.0";
+    }
+}
+
+
+--------------------------------------------------------------------------------
+1.2 TrackingService.java
+路径：app/src/main/java/com/example/devicefinder/TrackingService.java
+--------------------------------------------------------------------------------
+package com.example.devicefinder;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+public class TrackingService extends Service implements LocationListener {
+
+    private LocationManager locationManager;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private ConnectivityManager.NetworkCallback networkCallback;
+
+    private long reportIntervalMs = 1800 * 1000L; 
+    private String accuracyMode = "coarse";       
+    private Location lastLocation = null;
+
+    private static long lastReportTime = 0;
+    private static int consecutiveFailures = 0;
+    private static boolean isListeningForRescue = false;
+
+    private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
+    private static final String AUTH_TOKEN = "your_private_secret_key";
+    private static final String RESCUE_SECRET = "your_private_secret_key";
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        startForegroundNotification();
+        registerNetworkCallback();
+        startTracking();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
+            sendReport();
+        }
+        return START_STICKY;
+    }
+
+    private void startForegroundNotification() {
+        String channelId = "device_guardian_channel";
+        Notification.Builder builder;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    channelId, "设备安全守护", NotificationManager.IMPORTANCE_LOW);
+            NotificationManager manager = (NotificationManager) getSystemService(NotificationManager.class);
+            if (manager != null) manager.createNotificationChannel(channel);
+            builder = new Notification.Builder(this, channelId);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+        Notification notification = builder.setContentTitle("设备安全守护")
+                .setContentText("系统后台运行中")
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .build();
+        startForeground(1001, notification);
+    }
+
+    private String getUniqueDeviceId() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        String deviceId = sp.getString("saved_device_id", null);
+        if (deviceId == null) {
+            String model = Build.MODEL != null ? Build.MODEL.replaceAll("\\s+", "_") : "UnknownPhone";
+            int randomNum = (int)((Math.random() * 9000) + 1000);
+            deviceId = model + "_" + randomNum;
+            sp.edit().putString("saved_device_id", deviceId).apply();
+        }
+        return deviceId;
+    }
+
+    private String getCurrentServerUrl() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getString("saved_server_url", defaultServerUrl);
+    }
+
+    private void saveNewServerUrl(String newUrl) {
+        if (newUrl != null && !newUrl.isEmpty()) {
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            sp.edit().putString("saved_server_url", newUrl).apply();
+        }
+    }
+
+    private void registerNetworkCallback() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                NetworkRequest request = new NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                        .build();
+                
+                networkCallback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        super.onAvailable(network);
+                        String oldSsid = DeviceInfoUtils.cachedSsid;
+                        String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
+                        String newSsid = wifiInfo[0];
+                        
+                        if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
+                        
+                        if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
+                            sendReport();
+                            scheduleNextReport(); 
+                        }
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        super.onLost(network);
+                        sendReport();
+                        scheduleNextReport();
+                    }
+                };
+                cm.registerNetworkCallback(request, networkCallback);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void startTracking() {
+        try {
+            locationManager.removeUpdates(this);
+            if ("fine".equals(accuracyMode) && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, reportIntervalMs, 0f, this);
+            }
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, reportIntervalMs, 0f, this);
+            }
+        } catch (SecurityException ignored) {}
+        scheduleNextReport();
+    }
+
+    private final Runnable reportRunnable = new Runnable() {
+        @Override
+        public void run() {
+            sendReport();
+            scheduleNextReport();
+        }
+    };
+
+    private void scheduleNextReport() {
+        handler.removeCallbacks(reportRunnable);
+        handler.postDelayed(reportRunnable, reportIntervalMs);
+    }
+
+    private void sendReport() {
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastReportTime < 5000) return;
+        lastReportTime = currentTime;
+
+        final String activeUrl = getCurrentServerUrl();
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                boolean success = false;
+                try {
+                    int[] battery = DeviceInfoUtils.getBatteryInfo(TrackingService.this);
+                    String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
+                    String ip = DeviceInfoUtils.getLocalIpAddress();
+
+                    Location loc = lastLocation;
+                    try {
+                        if (loc == null) loc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                    } catch (SecurityException ignored) {}
+
+                    JSONObject json = new JSONObject();
+                    json.put("device_id", getUniqueDeviceId());
+                    json.put("token", AUTH_TOKEN);
+                    json.put("timestamp", System.currentTimeMillis());
+
+                    JSONObject battObj = new JSONObject();
+                    battObj.put("level", battery[0]);
+                    battObj.put("is_charging", battery[1] == 1);
+                    json.put("battery", battObj);
+
+                    JSONObject netObj = new JSONObject();
+                    netObj.put("wifi_ssid", wifi[0]);
+                    netObj.put("wifi_bssid", wifi[1]);
+                    netObj.put("local_ip", ip);
+                    json.put("network", netObj);
+
+                    JSONObject locObj = new JSONObject();
+                    locObj.put("latitude", loc != null ? loc.getLatitude() : 0.0);
+                    locObj.put("longitude", loc != null ? loc.getLongitude() : 0.0);
+                    locObj.put("accuracy", loc != null ? loc.getAccuracy() : -1.0);
+                    locObj.put("provider", loc != null ? loc.getProvider() : "none");
+                    json.put("location", locObj);
+
+                    URL url = new URL(activeUrl);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    conn.setConnectTimeout(6000);
+                    conn.setReadTimeout(6000);
+                    conn.setDoOutput(true);
+
+                    OutputStream os = conn.getOutputStream();
+                    os.write(json.toString().getBytes("UTF-8"));
+                    os.flush();
+                    os.close();
+
+                    if (conn.getResponseCode() == 200) {
+                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line);
+                        br.close();
+                        
+                        parseResponse(new JSONObject(sb.toString()));
+                        success = true;
+                    }
+                    conn.disconnect();
+                } catch (Exception e) {
+                    success = false;
+                }
+
+                if (success) {
+                    consecutiveFailures = 0;
+                } else {
+                    consecutiveFailures++;
+                    if (consecutiveFailures >= 3 && !isListeningForRescue) {
+                        startRescueListener();
+                    }
+                }
+            }
+        }).start();
+    }
+
+    private void startRescueListener() {
+        isListeningForRescue = true;
+        
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                DatagramSocket rescueSocket = null;
+                try {
+                    rescueSocket = new DatagramSocket(8888);
+                    rescueSocket.setBroadcast(true);
+                    rescueSocket.setSoTimeout(60000); 
+                    
+                    byte[] buffer = new byte[512];
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    
+                    while (true) {
+                        rescueSocket.receive(packet); 
+                        String message = new String(packet.getData(), 0, packet.getLength());
+                        
+                        if (message.startsWith("FIND_ME_SERVER:")) {
+                            String[] parts = message.split(":", 3);
+                            if (parts.length == 3) {
+                                String receivedPassword = parts[1];
+                                String newServerUrl = parts[2].trim();
+                                
+                                if (RESCUE_SECRET.equals(receivedPassword)) {
+                                    saveNewServerUrl(newServerUrl);
+                                    consecutiveFailures = 0;
+                                    sendReport(); 
+                                    break; 
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    if (rescueSocket != null && !rescueSocket.isClosed()) {
+                        rescueSocket.close();
+                    }
+                    isListeningForRescue = false;
+                }
+            }
+        }).start();
+    }
+
+    private void parseResponse(JSONObject res) {
+        if (!res.has("config")) return;
+        JSONObject cfg = res.optJSONObject("config");
+        if (cfg == null) return;
+
+        long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
+        String newAccuracy = cfg.optString("accuracy_mode", "coarse");
+
+        if (newInterval != reportIntervalMs || !newAccuracy.equals(accuracyMode)) {
+            reportIntervalMs = newInterval;
+            accuracyMode = newAccuracy;
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    startTracking();
+                }
+            });
+        }
+
+        String nextServerUrl = cfg.optString("next_server_url", "");
+        if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
+            saveNewServerUrl(nextServerUrl);
+        }
+    }
+
+    @Override
+    public void onLocationChanged(Location location) {
+        if (location != null) lastLocation = location;
+    }
+
+    @Override public void onDestroy() {
+        super.onDestroy();
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                cm.unregisterNetworkCallback(networkCallback);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+    @Override public void onProviderEnabled(String provider) {}
+    @Override public void onProviderDisabled(String provider) {}
+    @Override public IBinder onBind(Intent intent) { return null; }
+}
+
+
+--------------------------------------------------------------------------------
+1.3 MainActivity.java
+路径：app/src/main/java/com/example/devicefinder/MainActivity.java
+--------------------------------------------------------------------------------
+package com.example.devicefinder;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+public class MainActivity extends Activity {
+
+    private TextView statusTextView;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 80, 50, 50);
+
+        statusTextView = new TextView(this);
+        statusTextView.setText("🛡️ 备用机守护服务运行中\n\n状态：等待权限与网络连接...");
+        statusTextView.setTextSize(16f);
+        layout.addView(statusTextView);
+
+        Button testButton = new Button(this);
+        testButton.setText("立即触发一次上报测试");
+        testButton.setPadding(20, 20, 20, 20);
+        testButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Toast.makeText(MainActivity.this, "已触发手动上报！", Toast.LENGTH_SHORT).show();
+                Intent intent = new Intent(MainActivity.this, TrackingService.class);
+                intent.setAction("ACTION_MANUAL_REPORT");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent);
+                } else {
+                    startService(intent);
+                }
+            }
+        });
+        
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        params.topMargin = 50;
+        testButton.setLayoutParams(params);
+        layout.addView(testButton);
+
+        setContentView(layout);
+        checkAndRequestPermissions();
+    }
+
+    private void checkAndRequestPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                }, 101);
+                return;
+            }
+        }
+        startGuardianService();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        startGuardianService();
+    }
+
+    private void startGuardianService() {
+        Intent intent = new Intent(this, TrackingService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+        statusTextView.setText("🛡️ 备用机守护服务运行中\n\n状态：后台定位与上报已激活");
+    }
+}
+
+
+--------------------------------------------------------------------------------
+1.4 AndroidManifest.xml
+路径：app/src/main/AndroidManifest.xml
+--------------------------------------------------------------------------------
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.devicefinder">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:label="备用机守护"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+        <service
+            android:name=".TrackingService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+
+================================================================================
+2. 服务端与运维脚本
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 server.py (稳定版 Socket 服务端)
+--------------------------------------------------------------------------------
+import socket
+import json
+
+PORT = 8000
+AUTH_TOKEN = "your_private_secret_key"
+
+GLOBAL_DEFAULT_CONFIG = {
+    "report_interval_seconds": 1800,
+    "accuracy_mode": "coarse",
+    "next_server_url": "http://192.168.1.123:8000/api/report"
+}
+
+ALL_DEVICES_STATUS = {}
+
+def start_socket_server():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(('0.0.0.0', PORT))
+    server_socket.listen(10)
+    
+    print(f"🚀 稳定版多设备定位服务器已成功启动，监听端口 {PORT}...")
+    print(f"👉 浏览器查看面板: http://你的电脑IP:{PORT}")
+
+    while True:
+        try:
+            client_conn, client_addr = server_socket.accept()
+            request = client_conn.recv(16384).decode('utf-8', errors='ignore')
+            if not request:
+                client_conn.close()
+                continue
+
+            if "POST /api/report" in request:
+                try:
+                    body = request.split("\r\n\r\n")[1]
+                    data = json.loads(body)
+
+                    if data.get("token") != AUTH_TOKEN:
+                        client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                        client_conn.close()
+                        continue
+
+                    dev_id = data.get("device_id", "unknown_device")
+                    ALL_DEVICES_STATUS[dev_id] = data
+
+                    print("\n" + "="*50)
+                    print(f"📥 [收到上报] 设备: 【{dev_id}】")
+                    print(f"🔋 电量: {data.get('battery', {}).get('level')}%")
+                    print(f"🛜 Wi-Fi: {data.get('network', {}).get('wifi_ssid')} (内网IP: {data.get('network', {}).get('local_ip')})")
+                    print(f"📍 定位: {data.get('location', {}).get('latitude')}, {data.get('location', {}).get('longitude')}")
+                    print("="*50)
+
+                    response_body = json.dumps({
+                        "status": "success",
+                        "config": GLOBAL_DEFAULT_CONFIG
+                    })
+
+                    response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response_body)}\r\n\r\n{response_body}"
+                    client_conn.sendall(response.encode('utf-8'))
+                except Exception as e:
+                    print(f"❌ 上报解析异常: {e}")
+                    client_conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+
+            elif "GET /" in request:
+                html = "<html><head><meta charset='utf-8'><title>设备监控面板</title></head><body>"
+                html += "<h2>🛡️ 备用机矩阵控制台</h2>"
+                html += f"<h3>当前在线/已上报设备总数: {len(ALL_DEVICES_STATUS)}</h3>"
+                html += "<table border='1' cellpadding='8' cellspacing='0'><tr><th>设备ID</th><th>电量</th><th>Wi-Fi名称</th><th>内网IP</th><th>最后经纬度</th></tr>"
+                
+                if len(ALL_DEVICES_STATUS) == 0:
+                    html += "<tr><td colspan='5' align='center'>暂无设备上报数据</td></tr>"
+                else:
+                    for dev_id, info in ALL_DEVICES_STATUS.items():
+                        batt = info.get('battery', {}).get('level', '?')
+                        ssid = info.get('network', {}).get('wifi_ssid', '?')
+                        ip = info.get('network', {}).get('local_ip', '?')
+                        lat = info.get('location', {}).get('latitude', 0)
+                        lng = info.get('location', {}).get('longitude', 0)
+                        html += f"<tr><td><b>{dev_id}</b></td><td>{batt}%</td><td>{ssid}</td><td>{ip}</td><td>{lat}, {lng}</td></tr>"
+                
+                html += "</table></body></html>"
+                
+                response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}"
+                client_conn.sendall(response.encode('utf-8'))
+            else:
+                client_conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+
+            client_conn.close()
+        except Exception as e:
+            print(f"Socket 循环异常: {e}")
+
+if __name__ == "__main__":
+    start_socket_server()
+
+
+--------------------------------------------------------------------------------
+2.2 rescue.py (局域网带密救援脚本)
+--------------------------------------------------------------------------------
+import socket
+import time
+
+RESCUE_SECRET = "your_private_secret_key"
+NEW_SERVER_URL = "http://192.168.1.123:8000/api/report"
+
+def send_secure_rescue():
+    message = f"FIND_ME_SERVER:{RESCUE_SECRET}:{NEW_SERVER_URL}"
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    
+    print("🔒 正在向局域网广播【带密码校验】的安全救援信号（持续 70 秒）...")
+    
+    for i in range(7):
+        print(f"[{i+1}/7] 正在呼叫失联备用机...")
+        sock.sendto(message.encode('utf-8'), ('255.255.255.255', 8888))
+        time.sleep(10)
+        
+    sock.close()
+    print("✅ 安全救援广播发送完毕。")
+
+if __name__ == "__main__":
+    send_secure_rescue()
+================================================================================
