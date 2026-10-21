@@ -9,6 +9,10 @@ import android.content.Intent;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -25,14 +29,15 @@ public class TrackingService extends Service implements LocationListener {
 
     private LocationManager locationManager;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private ConnectivityManager.NetworkCallback networkCallback;
 
-    // 默认配置（可动态修改）
-    private long reportIntervalMs = 1800 * 1000L; // 30 分钟
+    // 默认配置（可由服务端响应动态修改）
+    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";       // "coarse" 或 "fine"
     private Location lastLocation = null;
 
-    // TODO: 记得改成你电脑或服务器的局域网 IP（例如 http://192.168.1.100:8000/api/report）
-    private static final String SERVER_URL = "http://192.168.1.123:8000/api/report";
+    // TODO: 记得改成你电脑或服务器的局域网 IP
+    private static final String SERVER_URL = "http://你的服务器IP:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
 
     @Override
@@ -40,17 +45,20 @@ public class TrackingService extends Service implements LocationListener {
         super.onCreate();
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
+        
+        // 注册网络状态变动监听（实现 SSID 变化时即时插队上报）
+        registerNetworkCallback();
+        
         startTracking();
     }
 
-    // 核心：处理来自 MainActivity 的手动测试触发
+    // 支持处理来自 MainActivity 的手动测试触发
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
-            // 用户点击了按钮，立即在后台线程跑一次上报
             sendReport();
         }
-        return START_STICKY; // 确保服务被杀后尝试重启
+        return START_STICKY;
     }
 
     private void startForegroundNotification() {
@@ -70,6 +78,43 @@ public class TrackingService extends Service implements LocationListener {
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                 .build();
         startForeground(1001, notification);
+    }
+
+    // 注册系统网络变动回调
+    private void registerNetworkCallback() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                NetworkRequest request = new NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                        .build();
+                
+                networkCallback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        super.onAvailable(network);
+                        String oldSsid = DeviceInfoUtils.cachedSsid;
+                        String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
+                        String newSsid = wifiInfo[0];
+                        
+                        // 如果检测到 Wi-Fi 切换了（且不是未知状态），立刻即时插队上报一次！
+                        if (!oldSsid.equals(newSsid) && !newSsid.equals("UNKNOWN") && !newSsid.equals("<unknown ssid>")) {
+                            sendReport();
+                            scheduleNextReport(); // 重置定时周期
+                        }
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        super.onLost(network);
+                        // Wi-Fi 断开时也立即上报一次
+                        sendReport();
+                        scheduleNextReport();
+                    }
+                };
+                cm.registerNetworkCallback(request, networkCallback);
+            }
+        } catch (Exception ignored) {}
     }
 
     private void startTracking() {
@@ -188,6 +233,17 @@ public class TrackingService extends Service implements LocationListener {
         if (location != null) {
             lastLocation = location;
         }
+    }
+
+    @Override public void onDestroy() {
+        super.onDestroy();
+        // 清理网络监听回调
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                cm.unregisterNetworkCallback(networkCallback);
+            }
+        } catch (Exception ignored) {}
     }
 
     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
