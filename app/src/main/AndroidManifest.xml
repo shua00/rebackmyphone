@@ -2,29 +2,47 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.devicefinder">
 
-    <!-- 网络与定位权限 -->
+    <!-- 基础网络与状态权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    
+    <!-- 定位权限（粗糙与精细） -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     
-    <!-- 前台服务与高版本服务类型权限 -->
+    <!-- 前台服务与高版本定位服务类型权限 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+    <!-- 核心：开机自动启动权限 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:label="备用机守护"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
-        <!-- 核心：针对 Android 14/15/16 必须声明 foregroundServiceType="location" -->
+        <!-- 核心保活服务：针对 Android 14/15/16 声明 foregroundServiceType="location" -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="location" />
 
+        <!-- 开机自启广播接收器：支持系统重启后自动拉起守护服务 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 主界面 Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
