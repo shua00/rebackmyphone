@@ -7,6 +7,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ServiceInfo;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -34,21 +35,15 @@ public class TrackingService extends Service implements LocationListener {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private ConnectivityManager.NetworkCallback networkCallback;
 
-    // 默认配置（可由服务端动态修改）
     private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";       
     private Location lastLocation = null;
 
     private static long lastReportTime = 0;
-    
-    // 失联自愈计数器与状态锁
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    // 默认初始上报地址（后续可由服务端下发新地址动态热更新覆盖）
     private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
-    
-    // 鉴权密匙与局域网救援安全密码（必须与 rescue.py 中的 RESCUE_SECRET 一致）
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
@@ -69,6 +64,7 @@ public class TrackingService extends Service implements LocationListener {
         return START_STICKY;
     }
 
+    // 适配高版本的前台通知启动（兼容 Android 14 / 15 / 16）
     private void startForegroundNotification() {
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
@@ -85,10 +81,15 @@ public class TrackingService extends Service implements LocationListener {
                 .setContentText("系统后台运行中")
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                 .build();
-        startForeground(1001, notification);
+
+        // Android 14 (API 34) 及以上系统启动前台服务必须带上 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } else {
+            startForeground(1001, notification);
+        }
     }
 
-    // 方案一：动态生成并持久化唯一设备 ID (手机型号 + 4位随机数)
     private String getUniqueDeviceId() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String deviceId = sp.getString("saved_device_id", null);
@@ -101,13 +102,11 @@ public class TrackingService extends Service implements LocationListener {
         return deviceId;
     }
 
-    // 动态获取当前生效的上报服务器地址
     private String getCurrentServerUrl() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         return sp.getString("saved_server_url", defaultServerUrl);
     }
 
-    // 保存服务端下发的新服务器地址
     private void saveNewServerUrl(String newUrl) {
         if (newUrl != null && !newUrl.isEmpty()) {
             SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
@@ -115,7 +114,6 @@ public class TrackingService extends Service implements LocationListener {
         }
     }
 
-    // 注册网络变动回调（Wi-Fi 跨网即时插队上报）
     private void registerNetworkCallback() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -180,7 +178,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendReport() {
         long currentTime = System.currentTimeMillis();
-        if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
+        if (currentTime - lastReportTime < 5000) return;
         lastReportTime = currentTime;
 
         final String activeUrl = getCurrentServerUrl();
@@ -250,7 +248,6 @@ public class TrackingService extends Service implements LocationListener {
                     success = false;
                 }
 
-                // 智能失联自愈触发：连续失败达到 3 次时，自动开启 60 秒限时 UDP 监听等待救援
                 if (success) {
                     consecutiveFailures = 0;
                 } else {
@@ -263,7 +260,6 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
-    // 60秒限时、带密码校验的局域网 UDP 自愈监听器（零额外日常耗电）
     private void startRescueListener() {
         isListeningForRescue = true;
         
@@ -274,7 +270,7 @@ public class TrackingService extends Service implements LocationListener {
                 try {
                     rescueSocket = new DatagramSocket(8888);
                     rescueSocket.setBroadcast(true);
-                    rescueSocket.setSoTimeout(60000); // 60秒自动超时关闭
+                    rescueSocket.setSoTimeout(60000); 
                     
                     byte[] buffer = new byte[512];
                     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
@@ -283,7 +279,6 @@ public class TrackingService extends Service implements LocationListener {
                         rescueSocket.receive(packet); 
                         String message = new String(packet.getData(), 0, packet.getLength());
                         
-                        // 暗号格式预期：FIND_ME_SERVER:密码:新服务器网址
                         if (message.startsWith("FIND_ME_SERVER:")) {
                             String[] parts = message.split(":", 3);
                             if (parts.length == 3) {
@@ -293,7 +288,7 @@ public class TrackingService extends Service implements LocationListener {
                                 if (RESCUE_SECRET.equals(receivedPassword)) {
                                     saveNewServerUrl(newServerUrl);
                                     consecutiveFailures = 0;
-                                    sendReport(); // 立即向新地址心跳证明复活
+                                    sendReport(); 
                                     break; 
                                 }
                             }
@@ -329,7 +324,6 @@ public class TrackingService extends Service implements LocationListener {
             });
         }
 
-        // 动态热更新上报服务器地址
         String nextServerUrl = cfg.optString("next_server_url", "");
         if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
             saveNewServerUrl(nextServerUrl);
