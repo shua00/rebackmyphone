@@ -19,23 +19,22 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # 自动配置 Gradle 环境
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.4
 
-      - name: Build APK with Gradle
+      # 利用 GitHub 虚拟机自带的 Android SDK 编译
+      - name: Build APK
         run: |
-          # 自动赋予 gradlew 执行权限（如果有）
-          chmod +x ./gradlew 2>/dev/null || true
-          
-          # 执行打包命令
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace
-          else
-            gradle assembleDebug --stacktrace
-          fi
+          # 自动接受 SDK 许可
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          gradle assembleDebug --stacktrace
 
+      # 上传生成的 APK 文件
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/**/*.apk
+          path: app/build/outputs/apk/debug/*.apk
