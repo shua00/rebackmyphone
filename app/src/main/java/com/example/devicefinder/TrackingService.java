@@ -32,14 +32,15 @@ public class TrackingService extends Service implements LocationListener {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private ConnectivityManager.NetworkCallback networkCallback;
 
+    // 默认配置（可由服务端动态修改）
     private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
     private String accuracyMode = "coarse";       
     private Location lastLocation = null;
 
     private static long lastReportTime = 0;
 
-    // TODO: 改成你电脑或服务器的局域网 IP
-    private static final String SERVER_URL = "http://192.168.1.123:8000/api/report";
+    // 默认初始上报地址（后续可由服务端下发新地址并动态热更新覆盖）
+    private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
 
     @Override
@@ -65,7 +66,7 @@ public class TrackingService extends Service implements LocationListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
                     channelId, "设备安全守护", NotificationManager.IMPORTANCE_LOW);
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationManager manager = (NotificationManager) getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
             builder = new Notification.Builder(this, channelId);
         } else {
@@ -78,18 +79,31 @@ public class TrackingService extends Service implements LocationListener {
         startForeground(1001, notification);
     }
 
-    // 方案一核心：自动读取手机型号 + 4位随机数，并在本地持久化保存
+    // 方案一：动态生成并持久化唯一设备 ID
     private String getUniqueDeviceId() {
         SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
         String deviceId = sp.getString("saved_device_id", null);
-        
         if (deviceId == null) {
             String model = Build.MODEL != null ? Build.MODEL.replaceAll("\\s+", "_") : "UnknownPhone";
             int randomNum = (int)((Math.random() * 9000) + 1000);
-            deviceId = model + "_" + randomNum; // 例如：Pixel_6_5821 或 Redmi_K40_3021
+            deviceId = model + "_" + randomNum;
             sp.edit().putString("saved_device_id", deviceId).apply();
         }
         return deviceId;
+    }
+
+    // 动态获取当前生效的上报服务器地址（支持热更新持久化）
+    private String getCurrentServerUrl() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        return sp.getString("saved_server_url", defaultServerUrl);
+    }
+
+    // 保存服务端下发的新服务器地址
+    private void saveNewServerUrl(String newUrl) {
+        if (newUrl != null && !newUrl.isEmpty()) {
+            SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+            sp.edit().putString("saved_server_url", newUrl).apply();
+        }
     }
 
     private void registerNetworkCallback() {
@@ -159,6 +173,8 @@ public class TrackingService extends Service implements LocationListener {
         if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
         lastReportTime = currentTime;
 
+        final String activeUrl = getCurrentServerUrl();
+
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -173,7 +189,6 @@ public class TrackingService extends Service implements LocationListener {
                     } catch (SecurityException ignored) {}
 
                     JSONObject json = new JSONObject();
-                    // 使用方案一动态生成的唯一设备 ID！
                     json.put("device_id", getUniqueDeviceId());
                     json.put("token", AUTH_TOKEN);
                     json.put("timestamp", System.currentTimeMillis());
@@ -196,28 +211,41 @@ public class TrackingService extends Service implements LocationListener {
                     locObj.put("provider", loc != null ? loc.getProvider() : "none");
                     json.put("location", locObj);
 
-                    URL url = new URL(SERVER_URL);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(8000);
-                    conn.setDoOutput(true);
+                    // ==========================================
+                    // 支撑【多路服务器并发备份上报】
+                    // 如果你想同时发给两个服务器，可以把网址放进数组遍历
+                    // ==========================================
+                    String[] targetUrls = { activeUrl }; 
+                    // 示例：String[] targetUrls = { activeUrl, "http://your-backup-server.com/api/report" };
 
-                    OutputStream os = conn.getOutputStream();
-                    os.write(json.toString().getBytes("UTF-8"));
-                    os.flush();
-                    os.close();
+                    for (String targetUrl : targetUrls) {
+                        try {
+                            URL url = new URL(targetUrl);
+                            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                            conn.setRequestMethod("POST");
+                            conn.setRequestProperty("Content-Type", "application/json");
+                            conn.setConnectTimeout(6000);
+                            conn.setReadTimeout(6000);
+                            conn.setDoOutput(true);
 
-                    if (conn.getResponseCode() == 200) {
-                        BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                        StringBuilder sb = new StringBuilder();
-                        String line;
-                        while ((line = br.readLine()) != null) sb.append(line);
-                        br.close();
-                        parseResponse(new JSONObject(sb.toString()));
+                            OutputStream os = conn.getOutputStream();
+                            os.write(json.toString().getBytes("UTF-8"));
+                            os.flush();
+                            os.close();
+
+                            if (conn.getResponseCode() == 200) {
+                                BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                                StringBuilder sb = new StringBuilder();
+                                String line;
+                                while ((line = br.readLine()) != null) sb.append(line);
+                                br.close();
+                                
+                                // 解析响应，顺便接收可能动态下发的新服务器地址
+                                parseResponse(new JSONObject(sb.toString()));
+                            }
+                            conn.disconnect();
+                        } catch (Exception ignored) {}
                     }
-                    conn.disconnect();
                 } catch (Exception ignored) {}
             }
         }).start();
@@ -228,6 +256,7 @@ public class TrackingService extends Service implements LocationListener {
         JSONObject cfg = res.optJSONObject("config");
         if (cfg == null) return;
 
+        // 1. 动态调整上报频率和精度
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
 
@@ -240,6 +269,12 @@ public class TrackingService extends Service implements LocationListener {
                     startTracking();
                 }
             });
+        }
+
+        // 2. 动态热更新上报服务器地址（远程无缝迁移域名/公网IP）
+        String nextServerUrl = cfg.optString("next_server_url", "");
+        if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
+            saveNewServerUrl(nextServerUrl);
         }
     }
 
