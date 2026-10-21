@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -31,12 +32,13 @@ public class TrackingService extends Service implements LocationListener {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private ConnectivityManager.NetworkCallback networkCallback;
 
-    // 默认配置（可由服务端响应动态修改）
     private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
-    private String accuracyMode = "coarse";       // "coarse" 或 "fine"
+    private String accuracyMode = "coarse";       
     private Location lastLocation = null;
 
-    // TODO: 记得改成你电脑或服务器的局域网 IP
+    private static long lastReportTime = 0;
+
+    // TODO: 改成你电脑或服务器的局域网 IP
     private static final String SERVER_URL = "http://192.168.1.123:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
 
@@ -45,14 +47,10 @@ public class TrackingService extends Service implements LocationListener {
         super.onCreate();
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
-        
-        // 注册网络状态变动监听（实现 SSID 变化时即时插队上报）
         registerNetworkCallback();
-        
         startTracking();
     }
 
-    // 支持处理来自 MainActivity 的手动测试触发
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
@@ -80,7 +78,20 @@ public class TrackingService extends Service implements LocationListener {
         startForeground(1001, notification);
     }
 
-    // 注册系统网络变动回调
+    // 方案一核心：自动读取手机型号 + 4位随机数，并在本地持久化保存
+    private String getUniqueDeviceId() {
+        SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
+        String deviceId = sp.getString("saved_device_id", null);
+        
+        if (deviceId == null) {
+            String model = Build.MODEL != null ? Build.MODEL.replaceAll("\\s+", "_") : "UnknownPhone";
+            int randomNum = (int)((Math.random() * 9000) + 1000);
+            deviceId = model + "_" + randomNum; // 例如：Pixel_6_5821 或 Redmi_K40_3021
+            sp.edit().putString("saved_device_id", deviceId).apply();
+        }
+        return deviceId;
+    }
+
     private void registerNetworkCallback() {
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -97,17 +108,17 @@ public class TrackingService extends Service implements LocationListener {
                         String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                         String newSsid = wifiInfo[0];
                         
-                        // 如果检测到 Wi-Fi 切换了（且不是未知状态），立刻即时插队上报一次！
-                        if (!oldSsid.equals(newSsid) && !newSsid.equals("UNKNOWN") && !newSsid.equals("<unknown ssid>")) {
+                        if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
+                        
+                        if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
                             sendReport();
-                            scheduleNextReport(); // 重置定时周期
+                            scheduleNextReport(); 
                         }
                     }
 
                     @Override
                     public void onLost(Network network) {
                         super.onLost(network);
-                        // Wi-Fi 断开时也立即上报一次
                         sendReport();
                         scheduleNextReport();
                     }
@@ -127,7 +138,6 @@ public class TrackingService extends Service implements LocationListener {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, reportIntervalMs, 0f, this);
             }
         } catch (SecurityException ignored) {}
-
         scheduleNextReport();
     }
 
@@ -145,6 +155,10 @@ public class TrackingService extends Service implements LocationListener {
     }
 
     private void sendReport() {
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
+        lastReportTime = currentTime;
+
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -159,7 +173,8 @@ public class TrackingService extends Service implements LocationListener {
                     } catch (SecurityException ignored) {}
 
                     JSONObject json = new JSONObject();
-                    json.put("device_id", "backup_phone");
+                    // 使用方案一动态生成的唯一设备 ID！
+                    json.put("device_id", getUniqueDeviceId());
                     json.put("token", AUTH_TOKEN);
                     json.put("timestamp", System.currentTimeMillis());
 
@@ -230,14 +245,11 @@ public class TrackingService extends Service implements LocationListener {
 
     @Override
     public void onLocationChanged(Location location) {
-        if (location != null) {
-            lastLocation = location;
-        }
+        if (location != null) lastLocation = location;
     }
 
     @Override public void onDestroy() {
         super.onDestroy();
-        // 清理网络监听回调
         try {
             ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             if (cm != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
