@@ -32,7 +32,7 @@ public class TrackingService extends Service implements LocationListener {
     private Location lastLocation = null;
 
     // TODO: 记得改成你电脑或服务器的局域网 IP（例如 http://192.168.1.100:8000/api/report）
-    private static final String SERVER_URL = "http://你的服务器IP:8000/api/report";
+    private static final String SERVER_URL = "http://192.168.1.123:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
 
     @Override
