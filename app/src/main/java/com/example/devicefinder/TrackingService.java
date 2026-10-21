@@ -31,7 +31,7 @@ public class TrackingService extends Service implements LocationListener {
     private String accuracyMode = "coarse";       // "coarse" 或 "fine"
     private Location lastLocation = null;
 
-    // TODO: 改成你自己的服务端接口与密钥
+    // TODO: 记得改成你电脑或服务器的局域网 IP（例如 http://192.168.1.100:8000/api/report）
     private static final String SERVER_URL = "http://你的服务器IP:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
 
@@ -41,6 +41,16 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
         startTracking();
+    }
+
+    // 核心：处理来自 MainActivity 的手动测试触发
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
+            // 用户点击了按钮，立即在后台线程跑一次上报
+            sendReport();
+        }
+        return START_STICKY; // 确保服务被杀后尝试重启
     }
 
     private void startForegroundNotification() {
