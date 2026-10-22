@@ -38,7 +38,7 @@ public class TrackingService extends Service implements LocationListener {
     private ConnectivityManager.NetworkCallback networkCallback;
 
     private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
-    private String accuracyMode = "coarse";       
+    private String accuracyMode = "coarse";
     private Location lastLocation = null;
 
     private static long lastReportTime = 0;
@@ -54,13 +54,13 @@ public class TrackingService extends Service implements LocationListener {
         super.onCreate();
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
-        
+
         // 1. 服务一创建/开机自启，立刻闪电上报一次
-        sendReport(); 
+        sendReport();
 
         // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
-        
+
         // 3. 启动定时轮询与定位
         startTracking();
     }
@@ -125,9 +125,9 @@ public class TrackingService extends Service implements LocationListener {
         try {
             PackageManager p = getPackageManager();
             ComponentName componentName = new ComponentName(this, "com.example.devicefinder.VisibleAliasActivity");
-            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED 
+            int newState = hideIcon ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED
                                     : PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-                                    
+
             if (p.getComponentEnabledSetting(componentName) != newState) {
                 p.setComponentEnabledSetting(componentName, newState, PackageManager.DONT_KILL_APP);
             }
@@ -141,7 +141,7 @@ public class TrackingService extends Service implements LocationListener {
                 NetworkRequest request = new NetworkRequest.Builder()
                         .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                         .build();
-                
+
                 networkCallback = new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
@@ -149,12 +149,12 @@ public class TrackingService extends Service implements LocationListener {
                         String oldSsid = DeviceInfoUtils.cachedSsid;
                         String[] wifiInfo = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                         String newSsid = wifiInfo[0];
-                        
+
                         if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
-                        
+
                         if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
                             sendReport();
-                            scheduleNextReport(); 
+                            scheduleNextReport();
                         }
                     }
 
@@ -221,7 +221,7 @@ public class TrackingService extends Service implements LocationListener {
                             Location netLoc = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
                             Location gpsLoc = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
                             Location passLoc = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
-                            
+
                             loc = getBetterLocation(netLoc, gpsLoc);
                             loc = getBetterLocation(loc, passLoc);
                         } catch (SecurityException ignored) {}
@@ -240,6 +240,7 @@ public class TrackingService extends Service implements LocationListener {
                     JSONObject netObj = new JSONObject();
                     netObj.put("wifi_ssid", wifi[0]);
                     netObj.put("wifi_bssid", wifi[1]);
+                    netObj.put("wifi_rssi", Integer.parseInt(wifi[2]));
                     netObj.put("local_ip", ip);
                     json.put("network", netObj);
 
@@ -248,6 +249,8 @@ public class TrackingService extends Service implements LocationListener {
                     locObj.put("longitude", loc != null ? loc.getLongitude() : 0.0);
                     locObj.put("accuracy", loc != null ? loc.getAccuracy() : -1.0);
                     locObj.put("provider", loc != null ? loc.getProvider() : "none");
+                    // 定位时间戳：服务器端可据此判断该坐标是实时定位还是旧缓存
+                    locObj.put("time", loc != null ? loc.getTime() : 0L);
                     json.put("location", locObj);
 
                     URL url = new URL(activeUrl);
@@ -269,7 +272,7 @@ public class TrackingService extends Service implements LocationListener {
                         String line;
                         while ((line = br.readLine()) != null) sb.append(line);
                         br.close();
-                        
+
                         parseResponse(new JSONObject(sb.toString()));
                         success = true;
                     }
@@ -316,7 +319,7 @@ public class TrackingService extends Service implements LocationListener {
 
     private void startRescueListener() {
         isListeningForRescue = true;
-        
+
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -324,26 +327,26 @@ public class TrackingService extends Service implements LocationListener {
                 try {
                     rescueSocket = new DatagramSocket(8888);
                     rescueSocket.setBroadcast(true);
-                    rescueSocket.setSoTimeout(60000); 
-                    
+                    rescueSocket.setSoTimeout(60000);
+
                     byte[] buffer = new byte[512];
                     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    
+
                     while (true) {
-                        rescueSocket.receive(packet); 
+                        rescueSocket.receive(packet);
                         String message = new String(packet.getData(), 0, packet.getLength());
-                        
+
                         if (message.startsWith("FIND_ME_SERVER:")) {
                             String[] parts = message.split(":", 3);
                             if (parts.length == 3) {
                                 String receivedPassword = parts[1];
                                 String newServerUrl = parts[2].trim();
-                                
+
                                 if (RESCUE_SECRET.equals(receivedPassword)) {
                                     saveNewServerUrl(newServerUrl);
                                     consecutiveFailures = 0;
-                                    sendReport(); 
-                                    break; 
+                                    sendReport();
+                                    break;
                                 }
                             }
                         }
