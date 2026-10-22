@@ -24,6 +24,8 @@ public class MainActivity extends Activity {
     // 防止权限回调与 onCreate 重复拉起服务
     private boolean serviceStarted = false;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -65,15 +67,21 @@ public class MainActivity extends Activity {
     private void proceedAfterForegroundLocation() {
         if (Build.VERSION.SDK_INT >= 29 && !hasBackgroundLocationPermission()) {
             if (Build.VERSION.SDK_INT >= 30) {
-                // Android 11+：无法通过弹窗授予后台定位，引导用户去设置页手动开启
-                // 但不阻塞服务启动——即使没有后台定位，前台服务运行期间仍可获取位置
-                Toast.makeText(this, "建议前往设置开启「始终允许」定位，以确保锁屏后仍可定位", Toast.LENGTH_LONG).show();
-                try {
-                    Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
-                    intent.setData(Uri.parse("package:" + getPackageName()));
-                    startActivity(intent);
-                } catch (Exception ignored) {}
-                // 不等待用户操作，直接继续走后续流程
+                // Android 11+：无法通过弹窗授予后台定位，必须引导用户去设置页手动开启。
+                // 延迟 500ms 再跳转，给系统权限状态变更和当前 Activity 一个缓冲，
+                // 避免"一闪而过"或页面被系统回收。
+                Toast.makeText(this, "请在设置页选择「权限」→「位置信息」→「始终允许」", Toast.LENGTH_LONG).show();
+                mainHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                            intent.setData(Uri.parse("package:" + getPackageName()));
+                            startActivity(intent);
+                        } catch (Exception ignored) {}
+                    }
+                }, 500);
+                // 不等待用户操作，继续走后续流程，保证服务能先跑起来
                 proceedAfterBackgroundLocation();
             } else {
                 // Android 10：仍可通过弹窗授予后台定位
@@ -105,18 +113,25 @@ public class MainActivity extends Activity {
         requestIgnoreBatteryOptimizations();
     }
 
-    // 引导用户关闭电池优化：只负责跳转，不阻塞服务启动，也不等待返回
+    // 引导用户关闭电池优化：优先直接弹窗，不支持时降级到电池优化列表页
     private void requestIgnoreBatteryOptimizations() {
         try {
             PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                // 弹出系统对话框，请求加入电池优化白名单
-                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                intent.setData(Uri.parse("package:" + getPackageName()));
-                startActivity(intent);
+            if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+
+            Intent directIntent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            directIntent.setData(Uri.parse("package:" + getPackageName()));
+
+            // 先检查设备是否支持直接弹窗（部分国产 ROM 未实现该 Action）
+            if (directIntent.resolveActivity(getPackageManager()) != null) {
+                startActivity(directIntent);
+            } else {
+                // 降级：打开电池优化列表，让用户手动找到本应用并设为「不优化」
+                Toast.makeText(this, "请在列表中找到本应用并设为「不优化」", Toast.LENGTH_LONG).show();
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
             }
         } catch (Exception ignored) {
-            // 部分 ROM 不支持该 Action，忽略即可
+            // 极少数 ROM 连列表页都不支持，静默忽略，不阻塞服务
         }
     }
 
@@ -163,7 +178,7 @@ public class MainActivity extends Activity {
         hideLauncherIcon();
 
         // 延迟关闭，给电池优化跳转动画和启动器刷新图标留出时间
-        new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+        mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 finish();
