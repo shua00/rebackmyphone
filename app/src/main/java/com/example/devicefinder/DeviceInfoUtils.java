@@ -16,6 +16,8 @@ public class DeviceInfoUtils {
     // 全局内存缓存：用来对抗 Android 10+ 后台无法直接读取 Wi-Fi SSID 的限制
     public static String cachedSsid = "UNKNOWN";
     public static String cachedBssid = "UNKNOWN";
+    // 缓存最后一次有效 RSSI（dBm），后台拿不到时回退使用
+    public static int cachedRssi = 0;
 
     // 获取电量信息 [电量百分比, 是否在充电(1/0)]
     public static int[] getBatteryInfo(Context context) {
@@ -32,15 +34,15 @@ public class DeviceInfoUtils {
         return new int[]{batteryPct, isCharging};
     }
 
-    // 获取 Wi-Fi 信息 [SSID, BSSID]（带内存缓存降级）
+    // 获取 Wi-Fi 信息 [SSID, BSSID, RSSI]（带内存缓存降级）
     public static String[] getWifiInfo(Context context) {
         WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wifiManager == null) return new String[]{cachedSsid, cachedBssid};
-        
+        if (wifiManager == null) return new String[]{cachedSsid, cachedBssid, String.valueOf(cachedRssi)};
+
         try {
             WifiInfo info = wifiManager.getConnectionInfo();
             String ssid = info != null ? info.getSSID() : "UNKNOWN";
-            
+
             // 如果成功拿到了非匿名的真实 SSID，立刻更新全局缓存
             if (ssid != null && !ssid.equals("<unknown ssid>") && !ssid.equals("UNKNOWN")) {
                 if (ssid.startsWith("\"") && ssid.endsWith("\"")) {
@@ -48,11 +50,12 @@ public class DeviceInfoUtils {
                 }
                 cachedSsid = ssid;
                 cachedBssid = info.getBSSID() != null ? info.getBSSID() : "UNKNOWN";
+                cachedRssi = info.getRssi();
             }
         } catch (Exception ignored) {}
 
-        // 如果当前在后台拿不到（系统返回 <unknown ssid>），则回退返回我们内存中记住的最后一次有效名称
-        return new String[]{cachedSsid, cachedBssid};
+        // 如果当前在后台拿不到（系统返回 <unknown ssid>），则回退返回我们内存中记住的最后一次有效值
+        return new String[]{cachedSsid, cachedBssid, String.valueOf(cachedRssi)};
     }
 
     // 获取内网 IPv4 地址
