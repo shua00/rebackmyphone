@@ -39,9 +39,12 @@ public class TrackingService extends Service implements LocationListener {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private ConnectivityManager.NetworkCallback networkCallback;
 
-    private long reportIntervalMs = 1800 * 1000L; // 默认 30 分钟
+    private long reportIntervalMs = 1800 * 1000L; // 常规间隔：默认 30 分钟
     private String accuracyMode = "coarse";
     private Location lastLocation = null;
+
+    // 已完成的定时上报次数，用于决定下一次的延迟
+    private int reportCount = 0;
 
     private static long lastReportTime = 0;
     private static int consecutiveFailures = 0;
@@ -57,14 +60,14 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
-        // 1. 服务一创建/开机自启，立刻闪电上报一次（附带周围 Wi-Fi 扫描）
-        sendReport(true);
+        // 1. 先发起一次单次定位，拿到结果或超时后再上报（避免冷启动时上报 0,0）
+        requestSingleLocationAndReport();
 
         // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
 
-        // 3. 启动定时轮询与定位
-        startTracking();
+        // 3. 启动持续定位监听（不在这里安排定时上报，由 requestSingleLocationAndReport 触发首次后接管）
+        startLocationUpdates();
     }
 
     @Override
@@ -155,9 +158,10 @@ public class TrackingService extends Service implements LocationListener {
                         if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
 
                         if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
-                            // 网络切换触发上报，附带周围 Wi-Fi 扫描
+                            // 网络切换触发上报，附带周围 Wi-Fi 扫描。
+                            // 注意：不重置 reportCount，也不重新排程定时器，
+                            // 以免插队上报打乱 3 分钟 / 6 分钟 / 30 分钟的节奏。
                             sendReport(true);
-                            scheduleNextReport();
                         }
                     }
 
@@ -166,7 +170,6 @@ public class TrackingService extends Service implements LocationListener {
                         super.onLost(network);
                         // 断网触发上报，附带周围 Wi-Fi 扫描（此时可能拿不到，静默跳过）
                         sendReport(true);
-                        scheduleNextReport();
                     }
                 };
                 cm.registerNetworkCallback(request, networkCallback);
@@ -174,32 +177,102 @@ public class TrackingService extends Service implements LocationListener {
         } catch (Exception ignored) {}
     }
 
-    private void startTracking() {
+    // 持续定位监听：minTime 固定为 60 秒，让 lastLocation 持续被真实定位刷新，
+    // 与定时上报的 30 分钟节奏解耦。
+    private void startLocationUpdates() {
         try {
             locationManager.removeUpdates(this);
+            long minTime = 60000L;
             if ("fine".equals(accuracyMode) && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, reportIntervalMs, 0f, this);
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, minTime, 0f, this);
             }
             if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, reportIntervalMs, 0f, this);
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, minTime, 0f, this);
             }
         } catch (SecurityException ignored) {}
-        scheduleNextReport();
     }
+
+    // ==================== 首次上报：单次定位后触发 ====================
+
+    private void requestSingleLocationAndReport() {
+        final boolean[] reported = new boolean[]{false};
+        final Handler timeoutHandler = new Handler(Looper.getMainLooper());
+
+        final LocationListener singleListener = new LocationListener() {
+            @Override
+            public void onLocationChanged(Location location) {
+                if (location != null) lastLocation = location;
+                if (!reported[0]) {
+                    reported[0] = true;
+                    timeoutHandler.removeCallbacksAndMessages(null);
+                    try {
+                        locationManager.removeUpdates(this);
+                    } catch (Exception ignored) {}
+                    sendReport(true);
+                    reportCount = 1;
+                    scheduleNextReport();
+                }
+            }
+            @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+            @Override public void onProviderEnabled(String provider) {}
+            @Override public void onProviderDisabled(String provider) {}
+        };
+
+        try {
+            // 优先用网络定位（室内更快），再叠加 GPS
+            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+            }
+            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0, 0, singleListener, Looper.getMainLooper());
+            }
+        } catch (SecurityException ignored) {}
+
+        // 10 秒超时兜底：无论是否拿到定位，都上报一次
+        timeoutHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!reported[0]) {
+                    reported[0] = true;
+                    try {
+                        locationManager.removeUpdates(singleListener);
+                    } catch (Exception ignored) {}
+                    sendReport(true);
+                    reportCount = 1;
+                    scheduleNextReport();
+                }
+            }
+        }, 10000);
+    }
+
+    // ==================== 定时上报节奏：3 分钟 → 3 分钟 → 30 分钟 ====================
 
     private final Runnable reportRunnable = new Runnable() {
         @Override
         public void run() {
             // 定时轮询上报不扫描周围 Wi-Fi，避免后台节流和耗电
             sendReport(false);
+            reportCount++;
             scheduleNextReport();
         }
     };
 
     private void scheduleNextReport() {
         handler.removeCallbacks(reportRunnable);
-        handler.postDelayed(reportRunnable, reportIntervalMs);
+
+        long delay;
+        if (reportCount == 1) {
+            delay = 3 * 60 * 1000L;   // 首次之后，3 分钟
+        } else if (reportCount == 2) {
+            delay = 3 * 60 * 1000L;   // 第二次之后，再 3 分钟（累计 6 分钟）
+        } else {
+            delay = reportIntervalMs; // 第三次及以后，默认 30 分钟
+        }
+
+        handler.postDelayed(reportRunnable, delay);
     }
+
+    // ==================== 上报核心 ====================
 
     private void sendReport(final boolean withNearbyWifi) {
         long currentTime = System.currentTimeMillis();
@@ -248,11 +321,20 @@ public class TrackingService extends Service implements LocationListener {
                     json.put("network", netObj);
 
                     JSONObject locObj = new JSONObject();
-                    locObj.put("latitude", loc != null ? loc.getLatitude() : 0.0);
-                    locObj.put("longitude", loc != null ? loc.getLongitude() : 0.0);
-                    locObj.put("accuracy", loc != null ? loc.getAccuracy() : -1.0);
-                    locObj.put("provider", loc != null ? loc.getProvider() : "none");
-                    locObj.put("time", loc != null ? loc.getTime() : 0L);
+                    if (loc != null) {
+                        locObj.put("latitude", loc.getLatitude());
+                        locObj.put("longitude", loc.getLongitude());
+                        locObj.put("accuracy", loc.getAccuracy());
+                        locObj.put("provider", loc.getProvider());
+                        locObj.put("time", loc.getTime());
+                    } else {
+                        // 没有定位时上报 null，服务器端可区分"无定位"与"坐标真的是 0,0"
+                        locObj.put("latitude", JSONObject.NULL);
+                        locObj.put("longitude", JSONObject.NULL);
+                        locObj.put("accuracy", -1.0);
+                        locObj.put("provider", "none");
+                        locObj.put("time", 0L);
+                    }
                     json.put("location", locObj);
 
                     // 仅在指定时机尝试扫描周围 Wi-Fi，失败静默跳过
@@ -331,6 +413,8 @@ public class TrackingService extends Service implements LocationListener {
         return l1;
     }
 
+    // ==================== 救援广播监听 ====================
+
     private void startRescueListener() {
         isListeningForRescue = true;
 
@@ -376,6 +460,8 @@ public class TrackingService extends Service implements LocationListener {
         }).start();
     }
 
+    // ==================== 解析服务端下发的策略 ====================
+
     private void parseResponse(JSONObject res) {
         if (!res.has("config")) return;
         JSONObject cfg = res.optJSONObject("config");
@@ -390,7 +476,11 @@ public class TrackingService extends Service implements LocationListener {
             handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    startTracking();
+                    startLocationUpdates();
+                    // 若已进入 30 分钟常规节奏，按新间隔重新排程
+                    if (reportCount >= 3) {
+                        scheduleNextReport();
+                    }
                 }
             });
         }
