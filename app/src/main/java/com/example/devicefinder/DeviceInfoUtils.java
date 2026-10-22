@@ -1,15 +1,26 @@
 package com.example.devicefinder;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
+import android.os.Handler;
+import android.os.Looper;
+
+import org.json.JSONObject;
+
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.List;
 
 public class DeviceInfoUtils {
 
@@ -18,6 +29,11 @@ public class DeviceInfoUtils {
     public static String cachedBssid = "UNKNOWN";
     // 缓存最后一次有效 RSSI（dBm），后台拿不到时回退使用
     public static int cachedRssi = 0;
+
+    // 周围 Wi-Fi 扫描最多等待时长
+    private static final long SCAN_TIMEOUT_MS = 3000L;
+    // 最多上报多少个热点（按信号强度排序后取前 N 个）
+    private static final int MAX_NEARBY_WIFI = 15;
 
     // 获取电量信息 [电量百分比, 是否在充电(1/0)]
     public static int[] getBatteryInfo(Context context) {
@@ -43,7 +59,6 @@ public class DeviceInfoUtils {
             WifiInfo info = wifiManager.getConnectionInfo();
             String ssid = info != null ? info.getSSID() : "UNKNOWN";
 
-            // 如果成功拿到了非匿名的真实 SSID，立刻更新全局缓存
             if (ssid != null && !ssid.equals("<unknown ssid>") && !ssid.equals("UNKNOWN")) {
                 if (ssid.startsWith("\"") && ssid.endsWith("\"")) {
                     ssid = ssid.substring(1, ssid.length() - 1);
@@ -54,7 +69,6 @@ public class DeviceInfoUtils {
             }
         } catch (Exception ignored) {}
 
-        // 如果当前在后台拿不到（系统返回 <unknown ssid>），则回退返回我们内存中记住的最后一次有效值
         return new String[]{cachedSsid, cachedBssid, String.valueOf(cachedRssi)};
     }
 
@@ -72,5 +86,109 @@ public class DeviceInfoUtils {
             }
         } catch (Exception ignored) {}
         return "0.0.0.0";
+    }
+
+    /**
+     * 异步扫描周围 Wi-Fi 热点，最多等待 3 秒。
+     * 返回按信号强度降序排列的前 15 个热点，每项为 {"ssid","bssid","rssi"}。
+     * 扫描失败（系统节流、后台限制、无结果）时返回空列表，调用方静默跳过即可。
+     * 注意：本方法会阻塞调用线程直到扫描完成或超时，务必在后台线程调用。
+     */
+    public static List<JSONObject> scanNearbyWifi(Context context) {
+        final List<JSONObject> result = new ArrayList<>();
+        final WifiManager wifiManager = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager == null) return result;
+
+        final Object lock = new Object();
+        final boolean[] done = new boolean[]{false};
+        final Handler handler = new Handler(Looper.getMainLooper());
+
+        final BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                try {
+                    List<ScanResult> scanResults = wifiManager.getScanResults();
+                    if (scanResults != null) {
+                        // 过滤掉空 SSID（隐藏网络）并按信号强度降序
+                        List<ScanResult> filtered = new ArrayList<>();
+                        for (ScanResult r : scanResults) {
+                            if (r.SSID != null && !r.SSID.isEmpty()) {
+                                filtered.add(r);
+                            }
+                        }
+                        Collections.sort(filtered, new Comparator<ScanResult>() {
+                            @Override
+                            public int compare(ScanResult a, ScanResult b) {
+                                return b.level - a.level; // 信号强的在前
+                            }
+                        });
+                        int count = Math.min(filtered.size(), MAX_NEARBY_WIFI);
+                        for (int i = 0; i < count; i++) {
+                            ScanResult r = filtered.get(i);
+                            try {
+                                JSONObject obj = new JSONObject();
+                                obj.put("ssid", r.SSID);
+                                obj.put("bssid", r.BSSID != null ? r.BSSID : "");
+                                obj.put("rssi", r.level);
+                                result.add(obj);
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                } catch (Exception ignored) {
+                } finally {
+                    synchronized (lock) {
+                        done[0] = true;
+                        lock.notifyAll();
+                    }
+                }
+            }
+        };
+
+        try {
+            context.registerReceiver(receiver, new IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION));
+        } catch (Exception e) {
+            return result;
+        }
+
+        boolean started;
+        try {
+            started = wifiManager.startScan();
+        } catch (Exception e) {
+            started = false;
+        }
+
+        if (!started) {
+            // 系统拒绝扫描（后台节流/频率限制），直接放弃
+            try {
+                context.unregisterReceiver(receiver);
+            } catch (Exception ignored) {}
+            return result;
+        }
+
+        // 等待广播或超时
+        synchronized (lock) {
+            long deadline = System.currentTimeMillis() + SCAN_TIMEOUT_MS;
+            while (!done[0]) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) break;
+                try {
+                    lock.wait(remaining);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }
+
+        // 无论是否收到广播，都要注销接收器
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    context.unregisterReceiver(receiver);
+                } catch (Exception ignored) {}
+            }
+        });
+
+        return result;
     }
 }
