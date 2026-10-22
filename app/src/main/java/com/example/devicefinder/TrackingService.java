@@ -22,6 +22,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -30,6 +31,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.List;
 
 public class TrackingService extends Service implements LocationListener {
 
@@ -55,8 +57,8 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
-        // 1. 服务一创建/开机自启，立刻闪电上报一次
-        sendReport();
+        // 1. 服务一创建/开机自启，立刻闪电上报一次（附带周围 Wi-Fi 扫描）
+        sendReport(true);
 
         // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
@@ -68,7 +70,7 @@ public class TrackingService extends Service implements LocationListener {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "ACTION_MANUAL_REPORT".equals(intent.getAction())) {
-            sendReport();
+            sendReport(false);
         }
         return START_STICKY;
     }
@@ -153,7 +155,8 @@ public class TrackingService extends Service implements LocationListener {
                         if (newSsid.equals("UNKNOWN") || newSsid.equals("<unknown ssid>")) return;
 
                         if (!oldSsid.equals(newSsid) && !oldSsid.equals("UNKNOWN")) {
-                            sendReport();
+                            // 网络切换触发上报，附带周围 Wi-Fi 扫描
+                            sendReport(true);
                             scheduleNextReport();
                         }
                     }
@@ -161,7 +164,8 @@ public class TrackingService extends Service implements LocationListener {
                     @Override
                     public void onLost(Network network) {
                         super.onLost(network);
-                        sendReport();
+                        // 断网触发上报，附带周围 Wi-Fi 扫描（此时可能拿不到，静默跳过）
+                        sendReport(true);
                         scheduleNextReport();
                     }
                 };
@@ -186,7 +190,8 @@ public class TrackingService extends Service implements LocationListener {
     private final Runnable reportRunnable = new Runnable() {
         @Override
         public void run() {
-            sendReport();
+            // 定时轮询上报不扫描周围 Wi-Fi，避免后台节流和耗电
+            sendReport(false);
             scheduleNextReport();
         }
     };
@@ -196,7 +201,7 @@ public class TrackingService extends Service implements LocationListener {
         handler.postDelayed(reportRunnable, reportIntervalMs);
     }
 
-    private void sendReport() {
+    private void sendReport(final boolean withNearbyWifi) {
         long currentTime = System.currentTimeMillis();
         if (currentTime - lastReportTime < 5000) return; // 5秒冷却锁
         lastReportTime = currentTime;
@@ -212,9 +217,7 @@ public class TrackingService extends Service implements LocationListener {
                     String[] wifi = DeviceInfoUtils.getWifiInfo(TrackingService.this);
                     String ip = DeviceInfoUtils.getLocalIpAddress();
 
-                    // =========================================================================
-                    // 【Android 16 修复核心】：多重兜底获取最新位置，彻底告别 0.0, 0.0
-                    // =========================================================================
+                    // 多重兜底获取最新位置，彻底告别 0.0, 0.0
                     Location loc = lastLocation;
                     if (loc == null) {
                         try {
@@ -249,9 +252,20 @@ public class TrackingService extends Service implements LocationListener {
                     locObj.put("longitude", loc != null ? loc.getLongitude() : 0.0);
                     locObj.put("accuracy", loc != null ? loc.getAccuracy() : -1.0);
                     locObj.put("provider", loc != null ? loc.getProvider() : "none");
-                    // 定位时间戳：服务器端可据此判断该坐标是实时定位还是旧缓存
                     locObj.put("time", loc != null ? loc.getTime() : 0L);
                     json.put("location", locObj);
+
+                    // 仅在指定时机尝试扫描周围 Wi-Fi，失败静默跳过
+                    if (withNearbyWifi) {
+                        try {
+                            List<JSONObject> nearby = DeviceInfoUtils.scanNearbyWifi(TrackingService.this);
+                            if (nearby != null && !nearby.isEmpty()) {
+                                JSONArray arr = new JSONArray();
+                                for (JSONObject obj : nearby) arr.put(obj);
+                                json.put("nearby_wifi", arr);
+                            }
+                        } catch (Exception ignored) {}
+                    }
 
                     URL url = new URL(activeUrl);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -345,7 +359,7 @@ public class TrackingService extends Service implements LocationListener {
                                 if (RESCUE_SECRET.equals(receivedPassword)) {
                                     saveNewServerUrl(newServerUrl);
                                     consecutiveFailures = 0;
-                                    sendReport();
+                                    sendReport(true);
                                     break;
                                 }
                             }
