@@ -5,18 +5,15 @@ import datetime
 PORT = 8000
 AUTH_TOKEN = "your_private_secret_key"
 
-# 全局默认策略（可在此处随时动态下发频率、精度及热更新新服务器地址）
 GLOBAL_DEFAULT_CONFIG = {
     "report_interval_seconds": 1800,
     "accuracy_mode": "coarse",
     "next_server_url": "http://192.168.1.123:8000/api/report"
 }
 
-# 内存数据库：存储所有备用机的最新情报
 ALL_DEVICES_STATUS = {}
 
 def format_loc_time(ts_ms):
-    """把毫秒时间戳转成可读时间，并标注距现在多久"""
     if not ts_ms:
         return "N/A"
     try:
@@ -52,13 +49,11 @@ def start_socket_server():
                 client_conn.close()
                 continue
 
-            # 1. 处理客户端 POST 定位/心跳上报
             if "POST /api/report" in request:
                 try:
                     body = request.split("\r\n\r\n")[1]
                     data = json.loads(body)
 
-                    # 校验鉴权 Token
                     if data.get("token") != AUTH_TOKEN:
                         client_conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
                         client_conn.close()
@@ -67,7 +62,6 @@ def start_socket_server():
                     dev_id = data.get("device_id", "unknown_device")
                     ALL_DEVICES_STATUS[dev_id] = data
 
-                    # 终端打印格式化情报
                     print("\n" + "="*50)
                     print(f"📥 [收到上报] 设备: 【{dev_id}】")
                     print(f"🔋 电量: {data.get('battery', {}).get('level')}% (充电中: {data.get('battery', {}).get('is_charging')})")
@@ -78,9 +72,15 @@ def start_socket_server():
                     print(f"📍 定位: {loc.get('latitude')}, {loc.get('longitude')} "
                           f"[{loc.get('provider')}, 精度 {loc.get('accuracy')}m]")
                     print(f"🕒 定位时间: {format_loc_time(loc.get('time', 0))}")
+                    nearby = data.get('nearby_wifi', [])
+                    print(f"📡 周围 Wi-Fi 热点数: {len(nearby)}")
+                    if nearby:
+                        for ap in nearby[:5]:
+                            print(f"    - {ap.get('ssid')} ({ap.get('bssid')}) {ap.get('rssi')} dBm")
+                        if len(nearby) > 5:
+                            print(f"    ... 其余 {len(nearby) - 5} 个省略")
                     print("="*50)
 
-                    # 组装响应包，下发最新策略
                     response_body = json.dumps({
                         "status": "success",
                         "config": GLOBAL_DEFAULT_CONFIG
@@ -92,7 +92,6 @@ def start_socket_server():
                     print(f"❌ 上报解析异常: {e}")
                     client_conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
 
-            # 2. 处理浏览器 GET 访问状态看板
             elif "GET /" in request:
                 html = "<html><head><meta charset='utf-8'><title>设备监控面板</title>"
                 html += "<style>"
@@ -107,10 +106,10 @@ def start_socket_server():
                 html += f"<h3>当前在线/已上报设备总数: {len(ALL_DEVICES_STATUS)}</h3>"
                 html += "<table>"
                 html += "<tr><th>设备ID</th><th>电量</th><th>Wi-Fi名称</th><th>RSSI</th>"
-                html += "<th>内网IP</th><th>最后经纬度</th><th>定位精度</th><th>定位时间</th></tr>"
+                html += "<th>内网IP</th><th>最后经纬度</th><th>定位精度</th><th>定位时间</th><th>周围热点</th></tr>"
 
                 if len(ALL_DEVICES_STATUS) == 0:
-                    html += "<tr><td colspan='8' align='center'>暂无设备上报数据</td></tr>"
+                    html += "<tr><td colspan='9' align='center'>暂无设备上报数据</td></tr>"
                 else:
                     for dev_id, info in ALL_DEVICES_STATUS.items():
                         batt = info.get('battery', {}).get('level', '?')
@@ -123,28 +122,6 @@ def start_socket_server():
                         acc = info.get('location', {}).get('accuracy', -1)
                         loc_time = info.get('location', {}).get('time', 0)
                         loc_time_str = format_loc_time(loc_time)
+                        nearby_count = len(info.get('nearby_wifi', []))
 
-                        html += f"<tr>"
-                        html += f"<td><b>{dev_id}</b></td>"
-                        html += f"<td>{batt}% {charging}</td>"
-                        html += f"<td>{ssid}</td>"
-                        html += f"<td>{rssi} dBm</td>"
-                        html += f"<td>{ip}</td>"
-                        html += f"<td>{lat}, {lng}</td>"
-                        html += f"<td>{acc} m</td>"
-                        html += f"<td>{loc_time_str}</td>"
-                        html += f"</tr>"
-
-                html += "</table></body></html>"
-
-                response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}"
-                client_conn.sendall(response.encode('utf-8'))
-            else:
-                client_conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
-
-            client_conn.close()
-        except Exception as e:
-            print(f"Socket 循环异常: {e}")
-
-if __name__ == "__main__":
-    start_socket_server()
+                        html += f"<tr
