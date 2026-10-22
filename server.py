@@ -124,4 +124,28 @@ def start_socket_server():
                         loc_time_str = format_loc_time(loc_time)
                         nearby_count = len(info.get('nearby_wifi', []))
 
-                        html += f"<tr
+                        html += f"<tr>"
+                        html += f"<td><b>{dev_id}</b></td>"
+                        html += f"<td>{batt}% {charging}</td>"
+                        html += f"<td>{ssid}</td>"
+                        html += f"<td>{rssi} dBm</td>"
+                        html += f"<td>{ip}</td>"
+                        html += f"<td>{lat}, {lng}</td>"
+                        html += f"<td>{acc} m</td>"
+                        html += f"<td>{loc_time_str}</td>"
+                        html += f"<td>{nearby_count}</td>"
+                        html += f"</tr>"
+
+                html += "</table></body></html>"
+
+                response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(html.encode('utf-8'))}\r\n\r\n{html}"
+                client_conn.sendall(response.encode('utf-8'))
+            else:
+                client_conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+
+            client_conn.close()
+        except Exception as e:
+            print(f"Socket 循环异常: {e}")
+
+if __name__ == "__main__":
+    start_socket_server()
