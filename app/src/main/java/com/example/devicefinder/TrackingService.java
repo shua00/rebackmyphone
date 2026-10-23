@@ -50,7 +50,7 @@ public class TrackingService extends Service implements LocationListener {
     private static int consecutiveFailures = 0;
     private static boolean isListeningForRescue = false;
 
-    private static String defaultServerUrl = "http://192.168.1.123:8000/api/report";
+    private static String defaultServerUrl = "http://192.168.1.21:8000/api/report";
     private static final String AUTH_TOKEN = "your_private_secret_key";
     private static final String RESCUE_SECRET = "your_private_secret_key";
 
