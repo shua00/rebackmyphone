@@ -380,6 +380,10 @@ public class TrackingService extends Service implements LocationListener {
                     conn.disconnect();
                 } catch (Exception e) {
                     success = false;
+                    // 【新增】打印出真正的报错原因！
+                    android.util.Log.e("TrackingService", "===== 上报失败啦 =====");
+                    android.util.Log.e("TrackingService", "目标URL: " + activeUrl);
+                    android.util.Log.e("TrackingService", "错误信息: " + e.toString());
                 }
 
                 if (success) {
